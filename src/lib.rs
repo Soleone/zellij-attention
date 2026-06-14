@@ -17,6 +17,8 @@ pub struct State {
     pub(crate) tabs: Vec<TabInfo>,
     pub(crate) panes: PaneManifest,
     pub(crate) notification_state: HashMap<u32, HashSet<NotificationType>>,
+    /// Panes that should fall back to Idle instead of clearing completely.
+    pub(crate) watched_panes: HashSet<u32>,
     /// Maps pane_id → tab name (stripped) at the time the notification was set.
     /// Used to verify pane-to-tab mapping during reorders.
     pub(crate) notified_tab_names: HashMap<u32, String>,
@@ -91,9 +93,26 @@ impl State {
         cleared
     }
 
+    pub(crate) fn set_pane_notification(&mut self, pane_id: u32, notification_type: NotificationType) {
+        let mut notifications = HashSet::new();
+        notifications.insert(notification_type);
+        self.notification_state.insert(pane_id, notifications);
+
+        // Record which tab this pane belongs to, so we can verify during reorders.
+        if let Some(tab_name) = self.find_tab_name_for_pane(pane_id) {
+            #[cfg(debug_assertions)]
+            eprintln!("zellij-attention: Notification for pane {} in tab '{}'", pane_id, tab_name);
+            self.notified_tab_names.insert(pane_id, tab_name);
+        }
+    }
+
     pub(crate) fn clear_pane_notification(&mut self, pane_id: u32) -> bool {
         if self.notification_state.remove(&pane_id).is_some() {
-            self.notified_tab_names.remove(&pane_id);
+            if self.watched_panes.contains(&pane_id) {
+                self.set_pane_notification(pane_id, NotificationType::Idle);
+            } else {
+                self.notified_tab_names.remove(&pane_id);
+            }
             #[cfg(debug_assertions)]
             eprintln!(
                 "zellij-attention: Cleared notifications for pane {}",
@@ -107,7 +126,7 @@ impl State {
     /// Removes notification entries for pane IDs that no longer exist.
     /// Returns true if any stale entries were removed.
     pub(crate) fn clean_stale_notifications(&mut self) -> bool {
-        if self.notification_state.is_empty() || self.panes.panes.is_empty() {
+        if (self.notification_state.is_empty() && self.watched_panes.is_empty()) || self.panes.panes.is_empty() {
             return false;
         }
 
@@ -121,6 +140,7 @@ impl State {
         let stale_ids: Vec<u32> = self
             .notification_state
             .keys()
+            .chain(self.watched_panes.iter())
             .filter(|id| !current_pane_ids.contains(id))
             .copied()
             .collect();
@@ -131,6 +151,7 @@ impl State {
 
         for id in &stale_ids {
             self.notification_state.remove(id);
+            self.watched_panes.remove(id);
             self.notified_tab_names.remove(id);
             #[cfg(debug_assertions)]
             eprintln!(
@@ -433,19 +454,17 @@ impl ZellijPlugin for State {
         // regardless of what happens during state mutation or tab renaming.
         unblock_cli_pipe_input(&pipe_message.name);
 
-        if event_type.eq_ignore_ascii_case("clear") {
+        if event_type.eq_ignore_ascii_case("watch") {
+            self.watched_panes.insert(pane_id);
+            self.set_pane_notification(pane_id, NotificationType::Idle);
+        } else if event_type.eq_ignore_ascii_case("unwatch") {
+            self.watched_panes.remove(&pane_id);
+            self.notification_state.remove(&pane_id);
+            self.notified_tab_names.remove(&pane_id);
+        } else if event_type.eq_ignore_ascii_case("clear") {
             self.clear_pane_notification(pane_id);
         } else if let Some(notification_type) = NotificationType::from_event_type(&event_type) {
-            let mut notifications = HashSet::new();
-            notifications.insert(notification_type);
-            self.notification_state.insert(pane_id, notifications);
-
-            // Record which tab this pane belongs to, so we can verify during reorders
-            if let Some(tab_name) = self.find_tab_name_for_pane(pane_id) {
-                #[cfg(debug_assertions)]
-                eprintln!("zellij-attention: Notification for pane {} in tab '{}'", pane_id, tab_name);
-                self.notified_tab_names.insert(pane_id, tab_name);
-            }
+            self.set_pane_notification(pane_id, notification_type);
         } else {
             eprintln!("zellij-attention: Unknown event type: {}\n", event_type);
             return false;
