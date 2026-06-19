@@ -25,9 +25,12 @@ https://github.com/user-attachments/assets/646effc0-1c24-413d-bef3-3d85591cd89b
 
 ## Installation
 
-Download or build the plugin and add it to your Zellij config:
+This repository does not currently ship a pre-built `.wasm` artifact. Build it locally with Rust/Cargo, then add it to your Zellij config:
 
 ```bash
+rustup target add wasm32-wasip1
+cargo build --target wasm32-wasip1 --release
+
 mkdir -p ~/.config/zellij/plugins
 cp target/wasm32-wasip1/release/zellij-attention.wasm ~/.config/zellij/plugins/
 ```
@@ -59,7 +62,7 @@ The plugin loads in the background with no visible pane — it won't consume scr
 
 ## Quick Start
 
-Use `zellij action pipe` with an empty payload:
+After building, installing, and loading the plugin, use `zellij action pipe` with an empty payload:
 
 ```bash
 # Start tracking this pane and show idle
