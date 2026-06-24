@@ -40,6 +40,118 @@ fn add_notification(state: &mut State, pane_id: u32, ntype: NotificationType) {
     state.notification_state.insert(pane_id, set);
 }
 
+fn pipe_event(name: &str) -> PipeMessage {
+    PipeMessage {
+        source: PipeSource::Keybind,
+        name: name.to_string(),
+        payload: None,
+        args: std::collections::BTreeMap::new(),
+        is_private: false,
+    }
+}
+
+/// A focused, non-plugin terminal pane is required for focused-pane events.
+fn state_with_focused_pane(pane_id: u32) -> State {
+    let mut state = State::default();
+    state.tabs = vec![make_tab(0, "work", true)];
+    state.panes = make_manifest(vec![(0, vec![make_pane(pane_id, false, true)])]);
+    state
+}
+
+fn notification_of(state: &State, pane_id: u32) -> Option<NotificationType> {
+    state
+        .notification_state
+        .get(&pane_id)
+        .and_then(|set| set.iter().copied().next())
+}
+
+#[test]
+fn test_arm_flags_focused_pane_then_cmd_done_completes() {
+    let mut state = state_with_focused_pane(7);
+
+    // Keybind fires `arm` with no pane id; the plugin resolves the focused pane.
+    state.pipe(pipe_event("zellij-attention::arm"));
+    assert!(state.armed_panes.contains(&7));
+    assert_eq!(notification_of(&state, 7), Some(NotificationType::Bash));
+
+    // Shell pings cmd_done when the foreground command returns to the prompt.
+    state.pipe(pipe_event("zellij-attention::cmd_done::7"));
+    assert!(!state.armed_panes.contains(&7));
+    assert_eq!(notification_of(&state, 7), Some(NotificationType::Completed));
+}
+
+#[test]
+fn test_cmd_done_is_noop_when_pane_not_armed() {
+    let mut state = state_with_focused_pane(7);
+
+    state.pipe(pipe_event("zellij-attention::cmd_done::7"));
+    assert!(state.armed_panes.is_empty());
+    assert_eq!(notification_of(&state, 7), None);
+}
+
+#[test]
+fn test_clear_cancels_pending_arm() {
+    let mut state = state_with_focused_pane(7);
+    state.pipe(pipe_event("zellij-attention::arm"));
+    assert!(state.armed_panes.contains(&7));
+
+    // Focusing the tab (or any clear) cancels the arm so a later command
+    // completion does not resurrect a Completed icon.
+    state.clear_pane_notification(7);
+    assert!(!state.armed_panes.contains(&7));
+
+    state.pipe(pipe_event("zellij-attention::cmd_done::7"));
+    assert_eq!(notification_of(&state, 7), None);
+}
+
+#[test]
+fn test_disarm_clears_without_completing() {
+    let mut state = state_with_focused_pane(7);
+    state.pipe(pipe_event("zellij-attention::arm"));
+
+    state.pipe(pipe_event("zellij-attention::disarm"));
+    assert!(!state.armed_panes.contains(&7));
+    assert_eq!(notification_of(&state, 7), None);
+}
+
+#[test]
+fn test_armed_pane_survives_active_tab_clear() {
+    // Regression: arming the tab you are *currently viewing* must not be wiped
+    // by the 0.5s active-tab auto-clear. Otherwise the pane is disarmed before
+    // the shell's cmd_done arrives and the completion is lost.
+    let mut state = State::default();
+    // Active tab the user is sitting on; name already carries an icon so the
+    // auto-clear guard (tab_name_has_icon) lets it proceed.
+    state.tabs = vec![make_tab(0, "work \u{23F3}", true)];
+    state.panes = make_manifest(vec![(0, vec![make_pane(7, false, true)])]);
+
+    state.pipe(pipe_event("zellij-attention::arm"));
+    assert!(state.armed_panes.contains(&7));
+    assert_eq!(notification_of(&state, 7), Some(NotificationType::Bash));
+
+    // Both auto-clear paths run on every 0.5s timer tick — neither may touch
+    // the armed pane.
+    assert!(!state.check_and_clear_active_tab());
+    assert!(!state.check_and_clear_focus());
+    assert!(state.armed_panes.contains(&7), "arm must survive active-tab clear");
+    assert_eq!(notification_of(&state, 7), Some(NotificationType::Bash));
+
+    // When the foreground command finishes, cmd_done completes it.
+    state.pipe(pipe_event("zellij-attention::cmd_done::7"));
+    assert!(!state.armed_panes.contains(&7));
+    assert_eq!(notification_of(&state, 7), Some(NotificationType::Completed));
+}
+
+#[test]
+fn test_arm_accepts_explicit_pane_id() {
+    let mut state = state_with_focused_pane(7);
+
+    // An explicit pane id overrides focus resolution (e.g. armed from elsewhere).
+    state.pipe(pipe_event("zellij-attention::arm::42"));
+    assert!(state.armed_panes.contains(&42));
+    assert_eq!(notification_of(&state, 42), Some(NotificationType::Bash));
+}
+
 #[test]
 fn test_strip_icons() {
     let state = State::default();

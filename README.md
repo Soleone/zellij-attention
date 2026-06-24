@@ -109,10 +109,59 @@ zellij-attention::EVENT_TYPE::PANE_ID
 | `waiting`, `prompt`, `user_prompt`, `user-prompt` | `▶` | Waiting for user prompt/input |
 | `completed`, `done` | `✓` | Task done |
 | `idle` | `○` | Idle |
+| `arm`, `in_progress`, `in-progress` | `⚡` | Manually flag a pane in-progress and remember it (see [Manual in-progress flag](#manual-in-progress-flag)) |
+| `cmd_done`, `cmd-done` | `✓` | Complete an **armed** pane; no-op if the pane was not armed |
+| `disarm` | `○` or — | Cancel a pending arm without emitting completed |
 
-`PANE_ID` is the numeric pane ID, usually available as `$ZELLIJ_PANE_ID` inside a pane.
+`PANE_ID` is the numeric pane ID, usually available as `$ZELLIJ_PANE_ID` inside a pane. For `arm` / `cmd_done` / `disarm` the `PANE_ID` is **optional** — when omitted, the plugin resolves the currently focused pane. This is what lets a keybind arm a pane without knowing its id.
 
 > Use `--name` broadcast pipes. Do not use `--plugin` for normal updates, because targeted pipes can launch extra plugin instances.
+
+## Manual in-progress flag
+
+A keyboard-driven "mark in-progress → auto-complete" flow that works **even while a foreground command is blocking the shell** (so no command wrapper is possible). It has two halves:
+
+1. **Arm** (`Alt Shift m` → `⚡`) — a Zellij keybind. Zellij, not the blocked shell, handles the keypress and messages the plugin to flag the focused pane.
+2. **Complete** (`⚡` → `✓` when the command finishes) — a shell hook. The plugin cannot see when a foreground command ends (no `RunCommand` permission, no such Zellij event), so the shell pings `cmd_done` from its prompt hook. It's a no-op unless the pane was armed.
+
+### 1. Keybind (config.kdl)
+
+```kdl
+// Broadcast pipe (no plugin path) so it reuses the load_plugins instance.
+bind "Alt Shift m" {
+    MessagePlugin {
+        name "zellij-attention::arm"
+    }
+}
+```
+
+### 2. Shell hook (auto-complete)
+
+Source the hook for your shell — it pings `cmd_done` when the prompt returns, and adds `attn` / `attn-cancel` prompt helpers:
+
+```bash
+# ~/.zshrc
+[ -f /path/to/zellij-attention/shell/zellij-attention.zsh ] \
+  && source /path/to/zellij-attention/shell/zellij-attention.zsh
+
+# ~/.bashrc
+[ -f /path/to/zellij-attention/shell/zellij-attention.bash ] \
+  && source /path/to/zellij-attention/shell/zellij-attention.bash
+```
+
+The shell hook is **optional** — without it, `Alt Shift m` still arms (`⚡`); you just clear it by focusing the pane (or bind a key to `disarm`) instead of getting the automatic `⚡ → ✓`.
+
+### Usage
+
+```text
+$ sleep 30          # long foreground command, shell is blocked
+  → press Alt Shift m   # tab gets ⚡ (Zellij intercepts the key)
+  → switch to another tab and work
+  → sleep finishes → tab flips to ✓
+  → focus the tab → ✓ clears
+```
+
+On the tab you are actively viewing, completion is silent (the `✓` only shows when you are away on another tab — consistent with `clear_on_tab_focus`). The zsh hook also honors `ZATTN_MIN_SECONDS` (default `0`) to skip pinging after very short commands.
 
 ## Watched Pane Semantics
 
@@ -165,6 +214,8 @@ zellij_attention completed
 zellij_attention clear
 zellij_attention unwatch
 ```
+
+For the manual in-progress flow, ready-made hooks live in [`shell/`](shell/): source `shell/zellij-attention.zsh` (zsh) or `shell/zellij-attention.bash` (bash). See [Manual in-progress flag](#manual-in-progress-flag).
 
 ## Development
 

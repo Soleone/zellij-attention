@@ -19,6 +19,10 @@ pub struct State {
     pub(crate) notification_state: HashMap<u32, HashSet<NotificationType>>,
     /// Panes that should fall back to Idle instead of clearing completely.
     pub(crate) watched_panes: HashSet<u32>,
+    /// Panes flagged in-progress via `arm`. The next `cmd_done` for an armed
+    /// pane resolves to Completed. Lets a keybind flag a pane while a foreground
+    /// command is still running and auto-complete it when the shell returns.
+    pub(crate) armed_panes: HashSet<u32>,
     /// Maps pane_id → tab name (stripped) at the time the notification was set.
     /// Used to verify pane-to-tab mapping during reorders.
     pub(crate) notified_tab_names: HashMap<u32, String>,
@@ -55,6 +59,11 @@ impl State {
             }
         }
         if let Some(focused_pane_id) = self.determine_focused_pane() {
+            // An armed pane keeps its in-progress icon while focused; only
+            // `cmd_done` (completion) or `disarm`/`clear` resolves it.
+            if self.armed_panes.contains(&focused_pane_id) {
+                return false;
+            }
             return self.clear_pane_notification(focused_pane_id);
         }
         false
@@ -80,9 +89,13 @@ impl State {
             return false;
         };
 
+        // Armed panes are deliberately exempt: an `arm` keeps its in-progress
+        // icon even while its tab is active, until `cmd_done` completes it or
+        // `disarm`/`clear` cancels it. Without this, the 0.5s timer would clear
+        // (and disarm) a pane armed on the tab you are currently viewing.
         let pane_ids: Vec<u32> = panes
             .iter()
-            .filter(|p| !p.is_plugin)
+            .filter(|p| !p.is_plugin && !self.armed_panes.contains(&p.id))
             .map(|p| p.id)
             .collect();
 
@@ -107,6 +120,9 @@ impl State {
     }
 
     pub(crate) fn clear_pane_notification(&mut self, pane_id: u32) -> bool {
+        // Any clear (explicit, focus-demote, etc.) also cancels a pending arm so
+        // a later command completion does not resurrect a Completed icon.
+        self.armed_panes.remove(&pane_id);
         if self.notification_state.remove(&pane_id).is_some() {
             if self.watched_panes.contains(&pane_id) {
                 self.set_pane_notification(pane_id, NotificationType::Idle);
@@ -152,6 +168,7 @@ impl State {
         for id in &stale_ids {
             self.notification_state.remove(id);
             self.watched_panes.remove(id);
+            self.armed_panes.remove(id);
             self.notified_tab_names.remove(id);
             #[cfg(debug_assertions)]
             eprintln!(
@@ -433,32 +450,85 @@ impl ZellijPlugin for State {
 
         let parts: Vec<&str> = message.split("::").collect();
 
-        let (event_type, pane_id) = if parts.len() >= 3 {
-            let event_type = parts[1].to_string();
-            let pane_id: u32 = match parts[2].parse() {
-                Ok(n) => n,
+        // parts[0] is the "zellij-attention" prefix, parts[1] the event type and
+        // parts[2] an optional explicit pane id. Focused-pane events such as
+        // `arm` omit the pane id and resolve the target pane themselves.
+        let Some(event_type) = parts.get(1).map(|s| s.to_string()) else {
+            eprintln!("zellij-attention: Invalid format. Use: zellij-attention::EVENT_TYPE[::PANE_ID]\n");
+            unblock_cli_pipe_input(&pipe_message.name);
+            return false;
+        };
+
+        let explicit_pane: Option<u32> = match parts.get(2) {
+            Some(raw) => match raw.parse() {
+                Ok(n) => Some(n),
                 Err(_) => {
-                    eprintln!("zellij-attention: Invalid pane_id: {}\n", parts[2]);
+                    eprintln!("zellij-attention: Invalid pane_id: {}\n", raw);
                     unblock_cli_pipe_input(&pipe_message.name);
                     return false;
                 }
-            };
-            (event_type, pane_id)
-        } else {
-            eprintln!("zellij-attention: Invalid format. Use: zellij-attention::EVENT_TYPE::PANE_ID\n");
-            unblock_cli_pipe_input(&pipe_message.name);
-            return false;
+            },
+            None => None,
         };
 
         // Unblock the CLI pipe immediately so the caller never hangs,
         // regardless of what happens during state mutation or tab renaming.
         unblock_cli_pipe_input(&pipe_message.name);
 
+        // `arm` flags the focused (or explicit) pane as in-progress and remembers
+        // it. This is what the keybind sends while a foreground command is still
+        // running, so the pane id is resolved from the currently focused pane.
+        if event_type.eq_ignore_ascii_case("arm")
+            || event_type.eq_ignore_ascii_case("in_progress")
+            || event_type.eq_ignore_ascii_case("in-progress")
+        {
+            let Some(pane_id) = explicit_pane.or_else(|| self.determine_focused_pane()) else {
+                eprintln!("zellij-attention: arm: no focused pane to flag\n");
+                return false;
+            };
+            self.armed_panes.insert(pane_id);
+            self.set_pane_notification(pane_id, NotificationType::Bash);
+            self.update_tab_names();
+            return false;
+        }
+
+        // `cmd_done` is sent by the shell when a foreground command finishes.
+        // It only acts on armed panes; for everything else it is a no-op.
+        if event_type.eq_ignore_ascii_case("cmd_done")
+            || event_type.eq_ignore_ascii_case("cmd-done")
+        {
+            let Some(pane_id) = explicit_pane.or_else(|| self.determine_focused_pane()) else {
+                return false;
+            };
+            if self.armed_panes.remove(&pane_id) {
+                self.set_pane_notification(pane_id, NotificationType::Completed);
+                self.update_tab_names();
+            }
+            return false;
+        }
+
+        // `disarm` cancels a pending arm without emitting Completed.
+        if event_type.eq_ignore_ascii_case("disarm") {
+            let Some(pane_id) = explicit_pane.or_else(|| self.determine_focused_pane()) else {
+                return false;
+            };
+            self.clear_pane_notification(pane_id);
+            self.update_tab_names();
+            return false;
+        }
+
+        // Every remaining event targets an explicit pane id.
+        let Some(pane_id) = explicit_pane else {
+            eprintln!("zellij-attention: Invalid format. Use: zellij-attention::EVENT_TYPE::PANE_ID\n");
+            return false;
+        };
+
         if event_type.eq_ignore_ascii_case("watch") {
             self.watched_panes.insert(pane_id);
             self.set_pane_notification(pane_id, NotificationType::Idle);
         } else if event_type.eq_ignore_ascii_case("unwatch") {
             self.watched_panes.remove(&pane_id);
+            self.armed_panes.remove(&pane_id);
             self.notification_state.remove(&pane_id);
             self.notified_tab_names.remove(&pane_id);
         } else if event_type.eq_ignore_ascii_case("clear") {
